@@ -1,0 +1,70 @@
+# Hourly collector: snapshots Kalshi prices and NWS forecasts into data/kalshi.db.
+# The database lives on its own "data" branch (one commit, overwritten each run),
+# so main stays clean and the repo doesn't grow with every snapshot.
+name: Collect hourly
+
+on:
+  schedule:
+    - cron: "7 * * * *"   # every hour at :07 UTC (the top of the hour is GitHub's busiest)
+  workflow_dispatch:       # adds a "Run workflow" button for manual runs
+
+permissions:
+  contents: write          # needed to push the data branch
+
+concurrency:
+  group: collect           # never run two at once; they'd overwrite each other
+  cancel-in-progress: false
+
+env:
+  SERIES: KXHIGHAUS KXHIGHNY KXHIGHCHI   # add a city here, nothing else changes
+
+jobs:
+  collect:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - run: pip install -r requirements.txt
+
+      - name: Load the database from the data branch
+        run: |
+          mkdir -p data
+          set +e
+          git ls-remote --exit-code --heads origin data > /dev/null
+          rc=$?
+          set -e
+          if [ $rc -eq 0 ]; then
+            git fetch --depth 1 origin data
+            git cat-file blob FETCH_HEAD:kalshi.db > data/kalshi.db
+            echo "Loaded existing database ($(du -h data/kalshi.db | cut -f1))"
+          elif [ $rc -eq 2 ]; then
+            echo "No data branch yet, starting a fresh database"
+          else
+            echo "Couldn't reach the data branch; stopping so existing data isn't overwritten"
+            exit 1
+          fi
+
+      - name: Snapshot Kalshi prices
+        run: python fetch_kalshi_data.py $SERIES
+
+      - name: Snapshot NWS forecasts
+        run: python nws.py $SERIES
+
+      - name: Save the database to the data branch
+        env:
+          TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          cd data
+          git init -q -b data
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add kalshi.db
+          git commit -q -m "Snapshot $(date -u +%Y-%m-%dT%H:%MZ)"
+          git push -q -f "https://x-access-token:${TOKEN}@github.com/${GITHUB_REPOSITORY}.git" data
+          echo "Saved"
